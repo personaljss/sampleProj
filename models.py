@@ -2,121 +2,178 @@ from sortedcontainers import SortedDict
 import logging
 import pandas as pd
 
+# Adding to models.py
+
+class DataProcessor:
+    """
+    DataProcesser class is responsible for loading and pre-processing the trading data.
+    """
+    
+    def __init__(self, file_path='AKBNK.E.csv'):
+        self.data = self.load_data(file_path)
+
+    def load_data(self,filename='AKBNK.E.csv'):
+        """
+        Load the trading data from the specified file and preprocess it.
+        :param filename: Name of the file containing the trading data.
+        :return: Processed DataFrame containing the trading data.
+        """
+        # Using pandas' read_csv function to read the data.
+        data = pd.read_csv(filename)
+
+        # Adding column names to the data frame
+        column_names = ["network_time", "bist_time", "msg_type", "asset_name", "side", "price", "que_loc", "qty", "order_id"]
+        data.columns = column_names
+
+        # Removing unnecessary orders from the data frame (only the add, execute, and delete orders should be there)
+        data = data[data["msg_type"].isin(["A", "E", "D"])]
+        
+        # Resetting the indexes to start from 0
+        data.reset_index(drop=True, inplace=True)
+
+        # Converting unix time to date-time objects
+        data['network_time'] = (pd.to_datetime(data['network_time'], unit='ns')
+                                .dt.tz_localize('UTC')
+                                .dt.tz_convert('Europe/Istanbul'))
+
+            
+        data['bist_time'] = pd.to_datetime(data['bist_time'], unit='ns').dt.tz_localize('UTC').dt.tz_convert('Europe/Istanbul')
+
+        return data
+    
+    def lob_dfs(self):
+        """
+        This function processes a DataFrame of orders.
+        It creates an OrderBook object, and for each order in the DataFrame, 
+        it adds the order to the order book and creates a snapshot of the order book state.
+        It returns the final state of the order book and a DataFrame of all the snapshots.
+        """
+        order_book = OrderBook()
+        snapshots = []
+
+        df_records = self.data.to_dict('records')
+
+        for record in df_records:
+            message = Message(**record)  # Create an Order object from the record
+            #order_book.last_exec_price=0
+            #order_book.last_exec_qty=0
+            order_book.on_new_message(message)  # Add the order to the order book
+            snapshot = order_book.snapshot(message.network_time, message.asset_name)  # Create a snapshot of the order book
+            if len(snapshots)>0 and snapshots[-1]['Date']==snapshot['Date']:  # If the last snapshot has the same timestamp as the current snapshot
+                snapshots[-1]=snapshot  # Replace the last snapshot with the current snapshot
+            else:
+                snapshots.append(snapshot)  # Otherwise, append the current snapshot to the list of snapshots
+
+        snapshot_df = pd.DataFrame(snapshots)  # Convert the list of snapshots to a DataFrame
+        return snapshot_df, order_book.get_executions()  # Return the final state of the DataFrame of snapshots
+
+    
+
 class OrderBook:
     """
     The OrderBook class represents a market order book, where orders from traders are stored.
-    Each order book is separated into two parts: bids (buy orders) and asks (sell orders).
-    The SortedDict structure is used to have the prices sorted, which is necessary for the operation of an order book.
     """
 
     def __init__(self):
         """
-        Initialize the order book. Bids and asks are represented with SortedDict for efficient access and order.
-        Two additional dictionaries are maintained to store quantity associated with each price point.
-        Each order is identified by its unique 'order_id' and can be quickly accessed using these dictionaries.
+        Initialize the order book.
         """
-        self.bids = SortedDict()  # Sorted dictionary for bids
-        self.asks = SortedDict()  # Sorted dictionary for asks
-        self.bid_order_dict = {}  # Dictionary for bid order objects with their order_ids
-        self.ask_order_dict = {}  # Dictionary for ask order objects with their order_ids
-        self.bid_qty_dict = {}    # Dictionary for quantities associated with each bid price
-        self.ask_qty_dict = {}    # Dictionary for quantities associated with each ask price
+        self.bids = SortedDict()
+        self.asks = SortedDict()
+        self.bid_order_dict = {}
+        self.ask_order_dict = {}
+        self.bid_qty_dict = {}
+        self.ask_qty_dict = {}
+        self.executions = SortedDict()  # A dictionary to represent executions
 
-    def add_order(self, order):
+    def on_new_message(self, message):
         """
-        Method to add an order to the order book.
-        The type of the order is checked, and then depending on whether it's a bid or ask, the order is added to the correct dictionary.
-        The quantity dictionary is also updated with the new order's quantity.
+        Method to handle different types of messages and modify the order book accordingly.
         """
-        if order.msg_type == 'A':  # If it's an 'add order' message
-            if order.side == 'B':  # If it's a bid order
-               # If this price point doesn't exist yet in the bid order dictionary, initialize it with an empty list and zero quantity
-                if order.price not in self.bids:
-                    self.bids[order.price] = []
-                    self.bid_qty_dict[order.price] = 0
-                # Add the new bid order to the bid order list and update the quantity dictionary
-                self.bids[order.price].append(order)
-                self.bid_order_dict[order.order_id] = order
-                self.bid_qty_dict[order.price] += order.qty
-            else:  # 'S' If it's an ask order
-                # Similar logic as the bid order, but for the ask order
-                if order.price not in self.asks:
-                    self.asks[order.price] = []
-                    self.ask_qty_dict[order.price] = 0
-                self.asks[order.price].append(order)
-                self.ask_order_dict[order.order_id] = order
-                self.ask_qty_dict[order.price] += order.qty
-        elif order.msg_type == 'D':  # If it's a 'delete order' message
-            self.delete_order(order)
-        elif order.msg_type == 'E':  # If it's an 'execute order' message
-            self.execute_order(order)
+        if message.msg_type == 'A':
+            self.add_order(message)
+        elif message.msg_type == 'D':
+            self.delete_order(message)
+        elif message.msg_type == 'E':
+            self.execute_order(message)
 
-    def delete_order(self, order):
+    def add_order(self, message):
         """
-        This method deletes an order from the order book.
-        It first checks whether it's a bid or ask order and then removes the order from the correct dictionary.
-        If the order to be deleted is not found in the dictionary, it raises an error.
+        Adds an order to the book based on its type.
         """
-        if order.side == 'B':  # If it's a bid order
-            if order.order_id in self.bid_order_dict:  # If the bid order is in the dictionary
-                # Get the original order from the dictionary
-                original_order = self.bid_order_dict[order.order_id]
-                if original_order.price in self.bids:
-                    # Remove the order from the bids dictionary and update the quantity dictionary
-                    self.bids[original_order.price].remove(original_order)
-                    self.bid_qty_dict[original_order.price] -= original_order.qty
-                    # If no more orders are associated with this price, remove it from the dictionary
-                    if not self.bids[original_order.price]:
-                        del self.bids[original_order.price]
-                        del self.bid_qty_dict[original_order.price]
-                # Remove the order from the bid_order_dict
-                del self.bid_order_dict[order.order_id]
-            else:  # If the order doesn't exist, print an error
-                logging.error(f"Bid order with ID {order.order_id} does not exist.")
-        else:  # 'S', If it's an ask order, the process is similar to the bid order
-            if order.order_id in self.ask_order_dict:
-                original_order = self.ask_order_dict[order.order_id]
-                if original_order.price in self.asks:
-                    self.asks[original_order.price].remove(original_order)
-                    self.ask_qty_dict[original_order.price] -= original_order.qty
-                    if not self.asks[original_order.price]:
-                        del self.asks[original_order.price]
-                        del self.ask_qty_dict[original_order.price]
-                del self.ask_order_dict[order.order_id]
-            else:
-                logging.error(f"Ask order with ID {order.order_id} does not exist.")
+        side_book = self.bids if message.side == 'B' else self.asks
+        order_dict = self.bid_order_dict if message.side == 'B' else self.ask_order_dict
+        qty_dict = self.bid_qty_dict if message.side == 'B' else self.ask_qty_dict
 
-    def execute_order(self, order):
+        if message.price not in side_book:
+            side_book[message.price] = []
+            qty_dict[message.price] = 0
+        side_book[message.price].append(message)
+        order_dict[message.order_id] = message
+        qty_dict[message.price] += message.qty
+
+    def delete_order(self, message):
         """
-        This method executes an order in the order book.
-        It first checks whether it's a bid or ask order, finds the existing order in the correct dictionary, and then reduces the quantity of the order.
-        If the order quantity becomes zero or less, the order is deleted from the book.
+        Deletes an order from the book.
         """
-        if order.side == 'B':  # If it's a bid order
-            if order.order_id in self.bid_order_dict:  # If the bid order is in the dictionary
-                existing_order = self.bid_order_dict[order.order_id]  # Get the existing order
-                existing_order.qty -= order.qty  # Decrease the quantity of the existing order
-                self.bid_qty_dict[existing_order.price] -= order.qty  # Update the quantity dictionary
-                if existing_order.qty <= 0:  # If the quantity is zero or less, delete the order
-                    self.delete_order(existing_order)
-            else:  # If the order doesn't exist, print an error
-                logging.error(f"Bid order with ID {order.order_id} does not exist.")
-        else:  # 'S', If it's an ask order, the process is similar to the bid order
-            if order.order_id in self.ask_order_dict:
-                existing_order = self.ask_order_dict[order.order_id]
-                existing_order.qty -= order.qty
-                self.ask_qty_dict[existing_order.price] -= order.qty
-                if existing_order.qty <= 0:
-                    self.delete_order(existing_order)
-            else:
-                logging.error(f"Ask order with ID {order.order_id} does not exist.")
+        side_book = self.bids if message.side == 'B' else self.asks
+        order_dict = self.bid_order_dict if message.side == 'B' else self.ask_order_dict
+        qty_dict = self.bid_qty_dict if message.side == 'B' else self.ask_qty_dict
+
+        if message.order_id in order_dict:
+            order = order_dict[message.order_id]
+            side_book[order.price].remove(order)
+            qty_dict[order.price] -= order.qty
+
+            if not side_book[order.price]:
+                del side_book[order.price]
+                del qty_dict[order.price]
+
+            del order_dict[message.order_id]
+        else:
+            logging.error(f"Order with ID {message.order_id} does not exist.")
+
+    def execute_order(self, message):
+        """
+        Executes or updates an order in the book.
+        """
+        order_dict = self.bid_order_dict if message.side == 'B' else self.ask_order_dict
+        qty_dict = self.bid_qty_dict if message.side == 'B' else self.ask_qty_dict
+
+        if message.order_id in order_dict:
+            order = order_dict[message.order_id]
+            order.qty -= message.qty
+            qty_dict[order.price] -= message.qty
+            # Log the execution
+            self.executions[message.network_time] = {
+                'execpx': order.price,
+                'execqty': message.qty
+            }
+            # If fully executed, remove from book
+            if order.qty <= 0:
+                self.delete_order(message)
+
+
+    
+    def get_executions(self):
+        """
+        Returns a DataFrame of the executions, indexed by time (in Istanbul time zone).
+        """
+        df = pd.DataFrame.from_dict(self.executions, orient='index')
+        if not df.index.tz:
+            df.index = pd.to_datetime(df.index, unit='ns').tz_localize('UTC')
+        df.index = df.index.tz_convert('Europe/Istanbul')
+
+        return df
+
+
+    
     def snapshot(self, timestamp, asset_name):
         """
         This method creates a snapshot of the current state of the order book.
         It takes the top 3 bid and ask prices and quantities from the respective dictionaries.
         The snapshot also includes a 'Mold Package', which is a string representation of all the orders in the order book.
         """
-
         # Extract top 3 bid and ask prices
         bid_prices = list(self.bids.keys())[-3:]  # get top 3 bid prices
         bid_prices.reverse()  # reverse to get highest price first
@@ -128,7 +185,7 @@ class OrderBook:
 
         # Generate the 'Mold Package', which is a string representation of all the orders
         mold_packages = [
-            f"A-{side}-{price}-{order.qty}-{order.order_id}"
+            f"{order.msg_type}-{side}-{price}-{order.qty}-{order.order_id}"
             for side, book in [('B', self.bids), ('S', self.asks)]
             for price in (bid_prices if side == 'B' else ask_prices)
             for order in book.get(price, [])
@@ -154,14 +211,40 @@ class OrderBook:
             "ask3qty": ask_qtys[2] if len(ask_qtys) > 2 else 0,
             "Mold Package": mold_package,
         }
+    
+    def create_df(self, df):
+        """
+        This function processes a DataFrame of orders.
+        It creates an OrderBook object, and for each order in the DataFrame, 
+        it adds the order to the order book and creates a snapshot of the order book state.
+        It returns the final state of the order book and a DataFrame of all the snapshots.
+        """
+        order_book = OrderBook()
+        snapshots = []
 
-# End of OrderBook class definition
+        df_records = df.to_dict('records')
 
-class Order:
+        for record in df_records:
+            message = Message(**record)  # Create an Order object from the record
+            #order_book.last_exec_price=0
+            #order_book.last_exec_qty=0
+            order_book.on_new_message(message)  # Add the order to the order book
+            snapshot = order_book.snapshot(message.network_time, message.asset_name)  # Create a snapshot of the order book
+            if len(snapshots)>0 and snapshots[-1]['Date']==snapshot['Date']:  # If the last snapshot has the same timestamp as the current snapshot
+                snapshots[-1]=snapshot  # Replace the last snapshot with the current snapshot
+            else:
+                snapshots.append(snapshot)  # Otherwise, append the current snapshot to the list of snapshots
+
+        snapshot_df = pd.DataFrame(snapshots)  # Convert the list of snapshots to a DataFrame
+        return snapshot_df  # Return the final state of the DataFrame of snapshots
+
+
+
+class Message:
     """
-    The Order class represents an order in the order book.
-    Each order has a network_time, bist_time, msg_type (A for Add, D for Delete, E for Execute), asset_name, side (B for Bid, S for Ask), price, que_loc, qty (quantity), and order_id.
+    Represents a message about an order, its execution or its deletion.
     """
+
     def __init__(self, network_time, bist_time, msg_type, asset_name, side, price, que_loc, qty, order_id):
         self.network_time = network_time
         self.bist_time = bist_time
@@ -173,25 +256,3 @@ class Order:
         self.qty = qty
         self.order_id = order_id
 
-def process_orders(df):
-    """
-    This function processes a DataFrame of orders.
-    It creates an OrderBook object, and for each order in the DataFrame, it adds the order to the order book and creates a snapshot of the order book state.
-    It returns the final state of the order book and a DataFrame of all the snapshots.
-    """
-    order_book = OrderBook()
-    snapshots = []
-
-    df_records = df.to_dict('records')
-
-    for record in df_records:
-        order = Order(**record)  # Create an Order object from the record
-        order_book.add_order(order)  # Add the order to the order book
-        snapshot = order_book.snapshot(order.network_time, order.asset_name)  # Create a snapshot of the order book
-        if len(snapshots)>0 and snapshots[-1]['Date']==snapshot['Date']:  # If the last snapshot has the same timestamp as the current snapshot
-            snapshots[-1]=snapshot  # Replace the last snapshot with the current snapshot
-        else:
-            snapshots.append(snapshot)  # Otherwise, append the current snapshot to the list of snapshots
-
-    snapshot_df = pd.DataFrame(snapshots)  # Convert the list of snapshots to a DataFrame
-    return order_book, snapshot_df  # Return the final state of the order book and the DataFrame of snapshots
