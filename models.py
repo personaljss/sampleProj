@@ -53,7 +53,7 @@ class DataProcessor:
 
         df_records = self.data.to_dict('records')
 
-        for record in tqdm(df_records):
+        for record in df_records:
             message = Message(**record)  # Create an Order object from the record
             #order_book.last_exec_price=0
             #order_book.last_exec_qty=0
