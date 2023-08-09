@@ -1,9 +1,9 @@
 from sortedcontainers import SortedDict
 import logging
 import pandas as pd
+import tqdm
 
 # Adding to models.py
-
 class DataProcessor:
     """
     DataProcesser class is responsible for loading and pre-processing the trading data.
@@ -53,7 +53,7 @@ class DataProcessor:
 
         df_records = self.data.to_dict('records')
 
-        for record in df_records:
+        for record in tqdm(df_records):
             message = Message(**record)  # Create an Order object from the record
             #order_book.last_exec_price=0
             #order_book.last_exec_qty=0
@@ -65,6 +65,7 @@ class DataProcessor:
                 snapshots.append(snapshot)  # Otherwise, append the current snapshot to the list of snapshots
 
         snapshot_df = pd.DataFrame(snapshots)  # Convert the list of snapshots to a DataFrame
+        snapshot_df.set_index('Date',inplace=True)
         return snapshot_df, order_book.get_executions()  # Return the final state of the DataFrame of snapshots
 
     
@@ -212,33 +213,6 @@ class OrderBook:
             "Mold Package": mold_package,
         }
     
-    def create_df(self, df):
-        """
-        This function processes a DataFrame of orders.
-        It creates an OrderBook object, and for each order in the DataFrame, 
-        it adds the order to the order book and creates a snapshot of the order book state.
-        It returns the final state of the order book and a DataFrame of all the snapshots.
-        """
-        order_book = OrderBook()
-        snapshots = []
-
-        df_records = df.to_dict('records')
-
-        for record in df_records:
-            message = Message(**record)  # Create an Order object from the record
-            #order_book.last_exec_price=0
-            #order_book.last_exec_qty=0
-            order_book.on_new_message(message)  # Add the order to the order book
-            snapshot = order_book.snapshot(message.network_time, message.asset_name)  # Create a snapshot of the order book
-            if len(snapshots)>0 and snapshots[-1]['Date']==snapshot['Date']:  # If the last snapshot has the same timestamp as the current snapshot
-                snapshots[-1]=snapshot  # Replace the last snapshot with the current snapshot
-            else:
-                snapshots.append(snapshot)  # Otherwise, append the current snapshot to the list of snapshots
-
-        snapshot_df = pd.DataFrame(snapshots)  # Convert the list of snapshots to a DataFrame
-        return snapshot_df  # Return the final state of the DataFrame of snapshots
-
-
 
 class Message:
     """
