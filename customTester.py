@@ -22,6 +22,7 @@ class Order():
         self.price=price
         self.sl=0
         self.tp=np.Infinity
+        self.deleted=False# if an order is deleted, this will be True
         self.exec_data=[]#this list will hold the dicts with keys price, time, volume to handle partial execution
     
     @property
@@ -71,10 +72,9 @@ class Trade():
     
     @property
     def active_size(self):
-        lots=self.size
-        for data in self.close_data:
-            lots-=data['volume']
-        return lots
+        closed_lots = sum([data['volume'] for data in self.close_data])
+        return self.size - closed_lots
+
     
     def close(self, price, volume, time):
         self.close_data.append({'price':price, 'volume' : volume, 'time':time})
@@ -82,7 +82,7 @@ class Trade():
     @classmethod
     def _generate_trade_id(cls):
         cls._trade_id_counter += 1
-        return str(cls._order_id_counter)
+        return str(cls._trade_id_counter)
     
 class Engine():
     def __init__(self, data : pd.DataFrame):
@@ -124,36 +124,46 @@ class Engine():
         self.strategy.add_data(self.data)
     
     def run(self):
+        start_time = time.time()
         if not self.strategy:
             raise ValueError("No strategy has been added. Use the add_strategy method to add one.")
         if self.strategy.data is None or self.strategy.data.empty:
             raise ValueError("No data has been added to the strategy. Use the add_data method to add one.")
         initial_balance=self.strategy.cash
-        for time in self.data.index:
+        
+        for current_time in self.data.index:
             #synchronising the times
-            self.current_time = time
-            self.strategy.current_time = time
+            self.current_time = current_time
+            self.strategy.current_time = current_time
             # adjust current positions
             self._check_trades()
-            # fill orders from previus period
+            # fill orders from previous period
             self._fill_orders()
-            
+                    
             # Run the strategy on the current bupdate
             self.strategy.on_update()
+
         
         last_bid=self.data[self.data['bid1px'] != 0]['bid1px'].iloc[-1]
         last_ask=self.data[self.data['ask1px'] != 0]['ask1px'].iloc[-1]
         hold_asset_value=0
+
+        end_time = time.time()
+        print(f"It took {end_time - start_time} seconds to run the test before result calculations.")
         
+        start_time=time.time()
         for pos in self.strategy.current_positions.values():
             if pos.side=='B':
                 hold_asset_value+=pos.active_size*last_ask
             else:
                 hold_asset_value-=pos.active_size*last_bid
+        end_time=time.time()
+        print(f"It took {end_time - start_time} seconds to run the results calculations.")
         return f"initial balance: {initial_balance}, final portfolio: {self.strategy.cash} cash and {hold_asset_value} assets"
             
     def _fill_orders(self):
-        """this method fills buy and sell orders, creating new trade objects and adjusting the strategy's cash balance.
+        """
+        This method fills buy and sell orders, creating new trade objects and adjusting the strategy's cash balance.
         Conditions for filling an order:
         - If we're buying, our cash balance has to be large enough to cover the order.
         - If we are selling, no constarint for the sake of simplicity, no margin calculations are needed now.   
@@ -172,7 +182,8 @@ class Engine():
                     else:
                         #the order should be deleted if it is a market order
                         if order.type=='market':
-                            self.strategy.order_delete(order)
+                            #self.strategy.order_delete(order)
+                            order.deleted=True
                 #if it is a buy                   
                 elif order.side=='B':
                     #we are handling the slippage
@@ -184,7 +195,8 @@ class Engine():
                     else:
                         #the  order should be deleted if it is a market order
                         if order.type=='market':
-                            self.strategy.order_delete(order)
+                            #self.strategy.order_delete(order)
+                            order.deleted=True
     
     def _check_trades(self):
         """
@@ -214,7 +226,7 @@ class Strategy():
         self.data = None
         self.cash = initial_cash
         self.orders = {} # this dict will hold the current waiting orders, keys are order id's
-        self.positions = {} #t his dict will hold the trade objects representing executed orders, keys are trade id's
+        self.positions = {} #this dict will hold the trade objects representing executed orders, keys are trade id's
         self.ticker=ticker
     
     #this method will return the limit orders that are not executed yet
@@ -222,7 +234,7 @@ class Strategy():
     def waiting_orders(self):
         wo={}
         for order in self.orders.values():
-            if order.waiting_volume>0 and order.type=='limit':
+            if order.waiting_volume>0 and order.deleted==False:
                 wo[order.id]=order
         return wo
     
@@ -254,16 +266,14 @@ class Strategy():
         
 
     def position_close(self, trade: Trade, price, volume_available, time):
-        #add the trade to closed trades, delete it from the current positions 
-        # if it is partially executed, add a new trade to the positions with the remaining lots
         trade.close_time=time
         trade.closed_price=price
         trade.close(price,volume_available,time)
         #Finally adjust the cash balance
         if trade.side=='B':
-            self.cash+=(price-trade.price)*trade.closed_size
+            self.cash+=(price-trade.price)*trade.active_size
         elif trade.size=='S':
-            self.cash+=(trade.price-price)*trade.closed_size           
+            self.cash+=(trade.price-price)*trade.active_size           
     
     @property
     def position_size(self):
@@ -278,14 +288,13 @@ class Strategy():
 class OBIStrategy(Strategy):
     def __init__(self, ticker, obi_threshold, initial_cash=100_000, slippage=0.01):
         super().__init__(ticker, initial_cash)
-        self.data = None
         self.obi_threshold = obi_threshold
         self.slippage = slippage  # Slippage for market orders
 
     def add_data(self, data : pd.DataFrame):
         # copying the data because when we do not do that, there may be warnings
         self.data=data.copy()
-        self.calculate_obi()  # Calculate OBI within constructor
+        self.calculate_obi() 
     
     def calculate_obi(self):
         self.data.loc[:, 'OBI'] = (self.data['bid1qty'] - self.data['ask1qty']) / (self.data['bid1qty'] + self.data['ask1qty'])
@@ -293,39 +302,37 @@ class OBIStrategy(Strategy):
         self.data.loc[self.data['OBI'] > self.obi_threshold, 'signal'] = 1
         self.data.loc[self.data['OBI'] < -self.obi_threshold, 'signal'] = -1
 
-    def close_positions(self, direction, price, volume,time):
+    def close_positions(self, side, price, volume,time):
         for trade in self.positions.values():
-            if trade.direction == direction:
+            if trade.side == side:
                 self.position_close(trade,price,volume,time)
 
 
     def on_update(self):
         obi_signal = self.data.loc[self.current_time, 'signal']
-        print(obi_signal)
+        buyers_price = self.data.loc[self.current_time, 'bid1px']
+        sellers_price = self.data.loc[self.current_time, 'ask1px']
         # Buy condition
-        if obi_signal == 1:
+        if obi_signal == 1 and sellers_price != 0:
             # Close any open sell trades
-            price = self.data.loc[self.current_time, 'bid1px']
             volume=self.data.loc[self.current_time,'bid1qty']
-            self.close_positions('S',price,volume,self.current_time)
+            self.close_positions('S',buyers_price,volume,self.current_time)
             # Place buy order
-            order = Order(self.ticker, 100, 'B', self.current_time, price,self.slippage)
-            order.tp = price + 0.02
-            order.sl = price - 0.02
+            order = Order(self.ticker, 100, 'B', self.current_time, sellers_price,self.slippage)
+            order.tp = sellers_price + 0.02
+            order.sl = sellers_price - 0.02
             self.order_send(order)
 
         # Sell condition
-        elif obi_signal == -1:
+        elif obi_signal == -1 and buyers_price != 0:
             # Close any open buy trades
-            price = self.data.loc[self.current_time, 'ask1px']
             volume=self.data.loc[self.current_time,'ask1qty']
             # Close any open sell trades
-            self.close_positions('B',price,volume,self.current_time)
+            self.close_positions('B',sellers_price,volume,self.current_time)
             # Place sell order
-            price = self.data.loc[self.current_time, 'bid1px']
-            order = Order(self.ticker, 100, 'S', self.current_time, price,self.slippage)
-            order.tp = price - 0.02
-            order.sl = price + 0.02
+            order = Order(self.ticker, 100, 'S', self.current_time, sellers_price,self.slippage)
+            order.tp = buyers_price - 0.02
+            order.sl = buyers_price + 0.02
             self.order_send(order)
 
 if __name__=="__main__":
@@ -336,7 +343,7 @@ if __name__=="__main__":
     end_time = time.time()
     print(f"It took {end_time - start_time} seconds to retrieve the data.")    
     
-    data = lob_snaps[lob_snaps.index < lob_snaps.index[0] + pd.Timedelta(minutes=120)]
+    data = lob_snaps[lob_snaps.index < lob_snaps.index[0] + pd.Timedelta(minutes=20)]
     engine=Engine(data)
     strategy=OBIStrategy("AKBNK",0.7,)
     engine.add_strategy(strategy)
