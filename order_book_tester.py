@@ -351,9 +351,10 @@ if __name__=="__main__":
     start_time = time.time()
     lob_snaps = data_processor.process()
     end_time = time.time()
+    lob_snaps.drop('Mold Package',axis=1).to_csv("my_lob.txt")    
     print(f"It took {end_time - start_time} seconds to retrieve the data.")    
     
-    data = lob_snaps.between_time('11:00','11:30')
+    data = lob_snaps.between_time('11:00','11:03')
     engine=Engine(data)
     strategy=OBIStrategy("AKBNK",0.7)
     engine.add_strategy(strategy)
