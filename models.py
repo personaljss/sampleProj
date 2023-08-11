@@ -12,7 +12,7 @@ class DataProcessor:
     def __init__(self, file_path='AKBNK.E.csv'):
         self.data = self.load_data(file_path)
 
-    def load_data(self,filename='AKBNK.E.csv'):
+    def load_data(self,filename) -> pd.DataFrame:
         """
         Load the trading data from the specified file and preprocess it.
         :param filename: Name of the file containing the trading data.
@@ -41,12 +41,12 @@ class DataProcessor:
 
         return data
     
-    def lob_dfs(self):
+    def process(self) -> pd.DataFrame:
         """
         This function processes a DataFrame of orders.
         It creates an OrderBook object, and for each order in the DataFrame, 
         it adds the order to the order book and creates a snapshot of the order book state.
-        It returns the final state of the order book and a DataFrame of all the snapshots.
+        It returns a DataFrame of all the snapshots.
         """
         order_book = OrderBook()
         snapshots = []
@@ -55,8 +55,6 @@ class DataProcessor:
 
         for record in df_records:
             message = Message(**record)  # Create an Order object from the record
-            #order_book.last_exec_price=0
-            #order_book.last_exec_qty=0
             order_book.on_new_message(message)  # Add the order to the order book
             snapshot = order_book.snapshot(message.network_time, message.asset_name)  # Create a snapshot of the order book
             if len(snapshots)>0 and snapshots[-1]['Date']==snapshot['Date']:  # If the last snapshot has the same timestamp as the current snapshot
@@ -66,7 +64,7 @@ class DataProcessor:
 
         snapshot_df = pd.DataFrame(snapshots)  # Convert the list of snapshots to a DataFrame
         snapshot_df.set_index('Date',inplace=True)
-        return snapshot_df, order_book.get_executions()  # Return the final state of the DataFrame of snapshots
+        return snapshot_df        
 
     
 
@@ -85,7 +83,7 @@ class OrderBook:
         self.ask_order_dict = {}
         self.bid_qty_dict = {}
         self.ask_qty_dict = {}
-        self.executions = SortedDict()  # A dictionary to represent executions
+        self.executions = {}  # A dictionary to represent executions
 
     def on_new_message(self, message):
         """
@@ -109,6 +107,7 @@ class OrderBook:
         if message.price not in side_book:
             side_book[message.price] = []
             qty_dict[message.price] = 0
+
         side_book[message.price].append(message)
         order_dict[message.order_id] = message
         qty_dict[message.price] += message.qty
@@ -145,7 +144,7 @@ class OrderBook:
             order = order_dict[message.order_id]
             order.qty -= message.qty
             qty_dict[order.price] -= message.qty
-            # Log the execution
+            # Log the execution, assuming only one execution can happen at a single network time,
             self.executions[message.network_time] = {
                 'execpx': order.price,
                 'execqty': message.qty
@@ -154,22 +153,8 @@ class OrderBook:
             if order.qty <= 0:
                 self.delete_order(message)
 
-
     
-    def get_executions(self):
-        """
-        Returns a DataFrame of the executions, indexed by time (in Istanbul time zone).
-        """
-        df = pd.DataFrame.from_dict(self.executions, orient='index')
-        if not df.index.tz:
-            df.index = pd.to_datetime(df.index, unit='ns').tz_localize('UTC')
-        df.index = df.index.tz_convert('Europe/Istanbul')
-
-        return df
-
-
-    
-    def snapshot(self, timestamp, asset_name):
+    def snapshot(self, timestamp, asset_name) -> dict:
         """
         This method creates a snapshot of the current state of the order book.
         It takes the top 3 bid and ask prices and quantities from the respective dictionaries.
@@ -194,6 +179,10 @@ class OrderBook:
 
         mold_package = ";".join(mold_packages)
 
+        #get the execution data, if no execution happened in this update, execpx and execqty are 0
+        exc_dict=self.executions.get(timestamp,{'execpx' : 0, 'execqty' : 0})
+
+
         # Return a dictionary representing the snapshot
         return {
             "Date": timestamp,  # use the passed timestamp
@@ -211,6 +200,8 @@ class OrderBook:
             "ask3px": ask_prices[2] if len(ask_prices) > 2 else 0,
             "ask3qty": ask_qtys[2] if len(ask_qtys) > 2 else 0,
             "Mold Package": mold_package,
+            "execpx" : exc_dict['execpx'],
+            "execqty" : exc_dict['execqty']
         }
     
 
